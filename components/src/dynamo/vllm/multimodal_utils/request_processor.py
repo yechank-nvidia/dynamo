@@ -789,6 +789,9 @@ class VllmMultimodalRequestProcessor:
             media_items=media_items,
             engine_client=self.engine_client,
             mm_processor_kwargs=mm_processor_kwargs,
+            multi_modal_uuids=_build_user_mm_uuids(
+                request.get("multi_modal_uuids"), self.use_unified_vision_chunk
+            ),
         )
 
     async def _receive_mm_kwargs(

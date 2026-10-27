@@ -104,6 +104,7 @@ def build_processed_media_input(
     media_items: list[ProcessedMedia],
     engine_client: Any,
     mm_processor_kwargs: dict[str, Any] | None,
+    multi_modal_uuids: dict[str, list[str | None]] | None = None,
 ) -> dict[str, Any]:
     if not media_items:
         raise ValueError("At least one processed media item is required")
@@ -138,6 +139,14 @@ def build_processed_media_input(
             for value in media.content_hashes
         ]
     }
+    user_uuids = (multi_modal_uuids or {}).get(modality)
+    if user_uuids is not None:
+        if len(user_uuids) != len(hashes[modality]):
+            raise ValueError("Processed media and multi_modal_uuids counts must match")
+        hashes[modality] = [
+            uuid if uuid is not None else content_hash
+            for uuid, content_hash in zip(user_uuids, hashes[modality])
+        ]
     placeholders = [
         PlaceholderRange(
             offset=value.offset,
