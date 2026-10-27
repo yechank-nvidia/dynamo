@@ -616,10 +616,15 @@ where
                 .into_iter()
                 .flat_map(|media| media.values())
                 .flatten()
-                .filter_map(|item| match item {
-                    MultimodalData::Decoded(descriptor) => descriptor.source_storage.clone(),
-                    _ => None,
+                .filter(|item| match item {
+                    MultimodalData::Decoded(descriptor) => descriptor.source_storage.is_some(),
+                    MultimodalData::Preprocessed(descriptor) => descriptor
+                        .fields
+                        .values()
+                        .any(|field| field.source_storage.is_some()),
+                    _ => false,
                 })
+                .cloned()
                 .collect::<Vec<_>>();
             if !source_guards.is_empty() {
                 attach_first_response_guard(&mut request, Arc::new(source_guards));
