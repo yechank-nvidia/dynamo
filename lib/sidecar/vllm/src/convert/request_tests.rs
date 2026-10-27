@@ -40,6 +40,30 @@ fn media_strings_move_into_generate_request() {
 }
 
 #[test]
+fn preprocessed_rdma_media_requires_url_passthrough() {
+    let descriptor = serde_json::from_value(json!({
+        "modality": "video",
+        "fields": {},
+        "feature_token_counts": [1],
+        "original_sizes": [[16, 16]],
+        "content_hashes": ["processed-video"]
+    }))
+    .unwrap();
+    let request = epd_request(vec![(
+        "video_url",
+        vec![MultimodalData::Preprocessed(descriptor)],
+    )]);
+    let error = build_generate_request(
+        request,
+        "processed-rdma".into(),
+        DisaggregationMode::Aggregated,
+    )
+    .expect_err("sidecar cannot dereference processed RDMA fields");
+    assert!(error.to_string().contains("configure URL passthrough"));
+    assert_invalid(error);
+}
+
+#[test]
 fn compatibility_envelope_preserves_typed_controls() {
     for mode in [DisaggregationMode::Aggregated, DisaggregationMode::Decode] {
         let request = PreprocessedRequest::builder()

@@ -955,9 +955,9 @@ fn build_media(
             let source = match item {
                 MultimodalData::Url(url) => media_source(&key, url.into())?,
                 MultimodalData::RawUrl(source) => media_source(&key, source)?,
-                MultimodalData::Decoded(_) => {
+                MultimodalData::Decoded(_) | MultimodalData::Preprocessed(_) => {
                     return Err(client::invalid_argument(
-                        "vLLM sidecar cannot dereference pre-decoded RDMA media; configure URL passthrough",
+                        "vLLM sidecar cannot dereference decoded or preprocessed RDMA media; configure URL passthrough",
                     ));
                 }
                 MultimodalData::UuidOnly(_) => {
