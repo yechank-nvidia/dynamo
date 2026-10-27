@@ -66,6 +66,13 @@ impl MediaDecoder {
     }
 }
 
+/// Model-specific preprocessing configured independently of media decoding.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct MediaPreprocessor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<dynamo_multimodal::registry::VideoProcessorConfig>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum DecodedMediaMetadata {
     Image(ImageMetadata),

@@ -28,7 +28,7 @@ from typing import Optional
 
 from dynamo._core import backend as _backend
 from dynamo.common.constants import DisaggregationMode
-from dynamo.llm import MediaDecoder, MediaFetcher, ModelInput
+from dynamo.llm import MediaDecoder, MediaFetcher, MediaPreprocessor, ModelInput
 from dynamo.runtime.logging import configure_dynamo_logging
 
 from .engine import BaseEngine, RawEngine
@@ -144,6 +144,7 @@ class WorkerConfig:
     kv_state_endpoint: Optional[str] = None
     default_thinking_mode: Optional[str] = None
     response_plane: str = "tcp"
+    media_preprocessor: Optional[MediaPreprocessor] = None
 
     @classmethod
     def from_runtime_config(
@@ -269,6 +270,7 @@ class Worker:
             runtime=runtime_cfg,
             route_to_encoder=self.config.route_to_encoder,
             media_decoder=self.config.media_decoder,
+            media_preprocessor=self.config.media_preprocessor,
             media_fetcher=self.config.media_fetcher,
         )
 

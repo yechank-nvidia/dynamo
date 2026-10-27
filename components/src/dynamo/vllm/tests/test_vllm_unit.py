@@ -2508,7 +2508,7 @@ async def test_register_vllm_model_freezes_gc_before_register_model(monkeypatch)
     monkeypatch.setattr(vllm_main, "per_rank_kv_blocks", lambda blocks, _: blocks)
     monkeypatch.setattr(vllm_main, "get_spec_decode_runtime_data", lambda *_: None)
     monkeypatch.setattr(
-        vllm_main, "create_frontend_media_config", lambda _: (None, None)
+        vllm_main, "create_frontend_media_config", lambda *args, **kwargs: (None, None, None)
     )
     monkeypatch.setattr(
         vllm_main,

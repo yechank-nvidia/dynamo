@@ -897,3 +897,44 @@ class TestFreezeGcAfterInit:
         config.headless = True
         config.disaggregation_mode = DisaggregationMode.ENCODE
         config._validate_freeze_gc_after_init()
+
+
+class TestValidateFrontendVideoPreprocessing:
+    def _enabled_config(self) -> DynamoVllmConfig:
+        config = create_config()
+        config.route_to_encoder = False
+        config.custom_encoder_class = None
+        config.frontend_video_preprocessing = True
+        config.frontend_decoding = True
+        config.enable_multimodal = True
+        config.disaggregation_mode = DisaggregationMode.AGGREGATED
+        return config
+
+    def test_requires_frontend_decoding(self):
+        config = self._enabled_config()
+        config.frontend_decoding = False
+        with pytest.raises(ValueError, match="frontend-decoding"):
+            config._validate_frontend_video_preprocessing()
+
+    def test_requires_multimodal(self):
+        config = self._enabled_config()
+        config.enable_multimodal = False
+        with pytest.raises(ValueError, match="enable-multimodal"):
+            config._validate_frontend_video_preprocessing()
+
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            DisaggregationMode.PREFILL,
+            DisaggregationMode.DECODE,
+            DisaggregationMode.ENCODE,
+        ],
+    )
+    def test_rejects_disaggregated_modes(self, mode):
+        config = self._enabled_config()
+        config.disaggregation_mode = mode
+        with pytest.raises(ValueError, match="aggregated"):
+            config._validate_frontend_video_preprocessing()
+
+    def test_accepts_aggregated_multimodal(self):
+        self._enabled_config()._validate_frontend_video_preprocessing()

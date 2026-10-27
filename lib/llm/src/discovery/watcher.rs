@@ -130,6 +130,7 @@ fn model_card_instance_id(instance: &DiscoveryInstance) -> anyhow::Result<ModelC
 fn uses_multimodal_cache_routing(card: &ModelDeploymentCard) -> bool {
     card.worker_type == Some(WorkerType::Encode)
         || card.media_decoder.is_some()
+        || card.media_preprocessor.is_some()
         || card.model_type.supports_images()
         || card.model_type.supports_videos()
         || card

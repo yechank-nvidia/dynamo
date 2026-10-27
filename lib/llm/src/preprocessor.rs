@@ -69,7 +69,9 @@ use crate::model_card::ModelInfoType;
 use crate::model_card::{ModelDeploymentCard, ModelInfo, PromptFormatterArtifact};
 #[cfg(feature = "mm-routing")]
 use crate::preprocessor::media::MediaFetcher;
-use crate::preprocessor::media::{MediaDecoder, MediaLoader, max_data_url_bytes};
+use crate::preprocessor::media::{
+    MediaDataDescriptor, MediaDecoder, MediaLoader, max_data_url_bytes,
+};
 use crate::protocols::common::preprocessor::{
     MultimodalData, MultimodalDataMap, MultimodalUuidMap, PreprocessedRequestBuilder, RoutingHints,
 };
@@ -2715,7 +2717,11 @@ impl OpenAIPreprocessor {
             });
 
         let media_loader = match mdc.media_decoder {
-            Some(media_decoder) => Some(MediaLoader::new(media_decoder, mdc.media_fetcher)?),
+            Some(media_decoder) => Some(MediaLoader::new(
+                media_decoder,
+                mdc.media_preprocessor,
+                mdc.media_fetcher,
+            )?),
             None => None,
         };
 
@@ -3846,134 +3852,148 @@ impl OpenAIPreprocessor {
 
             for (task, result) in fetch_tasks.into_iter().zip(results) {
                 // if one item fails, errors the whole request, other items will be cleaned up by Drop
-                let rdma_descriptor = result?;
+                let media_descriptor = result?;
 
                 #[cfg(feature = "mm-routing")]
-                if task.modality == "image_url" {
-                    let shape = &rdma_descriptor.tensor_info.shape;
-                    if shape.len() >= 2 {
-                        let h = shape[0] as u32;
-                        let w = shape[1] as u32;
-                        // Frontend-decode path: hash the decoded RGB bytes so
-                        // the same image reached via different (signed) URLs
-                        // collides on the same `mm_hash` and routes to the
-                        // worker that already has those KV blocks. Fall back
-                        // to URL hashing only if the descriptor lost local
-                        // storage (e.g. reconstructed from the wire), which
-                        // shouldn't happen on the frontend.
-                        let (mm_hash, hash_source) = match rdma_descriptor.content_hash() {
-                            Some(h) => (h, "decoded_bytes"),
-                            None => {
-                                let source_url = image_content_part_url(task.content_part.as_ref())
-                                    .ok_or_else(|| {
-                                        invalid_argument_error(
-                                            "image_url task must contain an image URL",
+                if let MediaDataDescriptor::Decoded(rdma_descriptor) = &media_descriptor {
+                    if task.modality == "image_url" {
+                        let shape = &rdma_descriptor.tensor_info.shape;
+                        if shape.len() >= 2 {
+                            let h = shape[0] as u32;
+                            let w = shape[1] as u32;
+                            // Frontend-decode path: hash the decoded RGB bytes so
+                            // the same image reached via different (signed) URLs
+                            // collides on the same `mm_hash` and routes to the
+                            // worker that already has those KV blocks. Fall back
+                            // to URL hashing only if the descriptor lost local
+                            // storage (e.g. reconstructed from the wire), which
+                            // shouldn't happen on the frontend.
+                            let (mm_hash, hash_source) = match rdma_descriptor.content_hash() {
+                                Some(h) => (h, "decoded_bytes"),
+                                None => {
+                                    let source_url =
+                                        image_content_part_url(task.content_part.as_ref())
+                                            .ok_or_else(|| {
+                                                invalid_argument_error(
+                                                    "image_url task must contain an image URL",
+                                                )
+                                            })?;
+                                    (Self::hash_image_url(source_url), "url_fallback")
+                                }
+                            };
+                            if let Some(counter) = self
+                                .image_token_counter
+                                .as_ref()
+                                .filter(|counter| !counter.uses_request_context_budget())
+                            {
+                                match counter.count_tokens(w, h) {
+                                    Ok(n) => {
+                                        tracing::debug!(
+                                            target: "mm_routing",
+                                            model = counter.model_id(),
+                                            width = w,
+                                            height = h,
+                                            tokens = n,
+                                            mm_hash = mm_hash,
+                                            source = hash_source,
+                                            "image-token count"
+                                        );
+                                        image_tokens = checked_add_image_tokens(image_tokens, n);
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            target: "mm_routing",
+                                            model = counter.model_id(),
+                                            %error,
+                                            "image-token accounting failed; using text-prefix routing"
+                                        );
+                                        image_tokens = None;
+                                        exact_mm_routing_eligible = false;
+                                    }
+                                }
+                            }
+                            mm_routing_entries.push(MmRoutingEntry::Image {
+                                mm_hash,
+                                width: w,
+                                height: h,
+                            });
+                        }
+                    } else if task.modality == "video_url" {
+                        #[cfg(feature = "media-ffmpeg")]
+                        {
+                            let video_entry = (|| -> Result<MmRoutingEntry> {
+                                let processor =
+                                    self.video_routing_processor.as_ref().ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "model has no exact video routing processor"
                                         )
                                     })?;
-                                (Self::hash_image_url(source_url), "url_fallback")
-                            }
-                        };
-                        if let Some(counter) = self
-                            .image_token_counter
-                            .as_ref()
-                            .filter(|counter| !counter.uses_request_context_budget())
-                        {
-                            match counter.count_tokens(w, h) {
-                                Ok(n) => {
-                                    tracing::debug!(
-                                        target: "mm_routing",
-                                        model = counter.model_id(),
-                                        width = w,
-                                        height = h,
-                                        tokens = n,
-                                        mm_hash = mm_hash,
-                                        source = hash_source,
-                                        "image-token count"
-                                    );
-                                    image_tokens = checked_add_image_tokens(image_tokens, n);
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        target: "mm_routing",
-                                        model = counter.model_id(),
-                                        %error,
-                                        "image-token accounting failed; using text-prefix routing"
-                                    );
-                                    image_tokens = None;
-                                    exact_mm_routing_eligible = false;
-                                }
-                            }
-                        }
-                        mm_routing_entries.push(MmRoutingEntry::Image {
-                            mm_hash,
-                            width: w,
-                            height: h,
-                        });
-                    }
-                } else if task.modality == "video_url" {
-                    #[cfg(feature = "media-ffmpeg")]
-                    {
-                        let video_entry = (|| -> Result<MmRoutingEntry> {
-                            let processor =
-                                self.video_routing_processor.as_ref().ok_or_else(|| {
-                                    anyhow::anyhow!("model has no exact video routing processor")
-                                })?;
-                            anyhow::ensure!(
-                                !has_processor_override,
-                                "request mm_processor_kwargs can change the video token layout"
-                            );
-                            let (frame_count, width, height) =
-                                rdma_descriptor.video_dimensions()?;
-                            let metadata = rdma_descriptor.video_metadata()?;
-                            let mm_hash = rdma_descriptor.video_content_hash()?;
-                            let routing =
-                                processor.build_replacement(&mm_routing::VideoRoutingInput {
-                                    frame_count,
-                                    width,
-                                    height,
-                                    source_fps: metadata.source_fps,
-                                    sampled_timestamps: &metadata.sampled_timestamps,
-                                })?;
-                            tracing::debug!(
-                                target: "mm_routing",
-                                n_frames = frame_count,
-                                width,
-                                height,
-                                replacement_tokens = routing.replacement_tokens.len(),
-                                mm_hash,
-                                "video routing metadata resolved"
-                            );
-                            Ok(MmRoutingEntry::Video {
-                                mm_hash,
-                                placeholder_token_id: routing.placeholder_token_id,
-                                event_video_token_id: routing.event_video_token_id,
-                                target_tokens: routing.target_tokens,
-                                replacement_tokens: routing.replacement_tokens,
-                            })
-                        })();
-                        match video_entry {
-                            Ok(entry) => mm_routing_entries.push(entry),
-                            Err(error) => {
-                                exact_mm_routing_eligible = false;
+                                anyhow::ensure!(
+                                    !has_processor_override,
+                                    "request mm_processor_kwargs can change the video token layout"
+                                );
+                                let (frame_count, width, height) =
+                                    rdma_descriptor.video_dimensions()?;
+                                let metadata = rdma_descriptor.video_metadata()?;
+                                let mm_hash = rdma_descriptor.video_content_hash()?;
+                                let routing = processor.build_replacement(
+                                    &mm_routing::VideoRoutingInput {
+                                        frame_count,
+                                        width,
+                                        height,
+                                        source_fps: metadata.source_fps,
+                                        sampled_timestamps: &metadata.sampled_timestamps,
+                                    },
+                                )?;
                                 tracing::debug!(
                                     target: "mm_routing",
-                                    %error,
-                                    "mm-routing: decoded video is not eligible for exact routing; falling back to text-prefix routing"
+                                    n_frames = frame_count,
+                                    width,
+                                    height,
+                                    replacement_tokens = routing.replacement_tokens.len(),
+                                    mm_hash,
+                                    "video routing metadata resolved"
                                 );
+                                Ok(MmRoutingEntry::Video {
+                                    mm_hash,
+                                    placeholder_token_id: routing.placeholder_token_id,
+                                    event_video_token_id: routing.event_video_token_id,
+                                    target_tokens: routing.target_tokens,
+                                    replacement_tokens: routing.replacement_tokens,
+                                })
+                            })();
+                            match video_entry {
+                                Ok(entry) => mm_routing_entries.push(entry),
+                                Err(error) => {
+                                    exact_mm_routing_eligible = false;
+                                    tracing::debug!(
+                                        target: "mm_routing",
+                                        %error,
+                                        "mm-routing: decoded video is not eligible for exact routing; falling back to text-prefix routing"
+                                    );
+                                }
                             }
                         }
+                        #[cfg(not(feature = "media-ffmpeg"))]
+                        {
+                            exact_mm_routing_eligible = false;
+                        }
                     }
-                    #[cfg(not(feature = "media-ffmpeg"))]
-                    {
-                        exact_mm_routing_eligible = false;
-                    }
+                } else {
+                    exact_mm_routing_eligible = false;
                 }
 
+                let media = match media_descriptor {
+                    MediaDataDescriptor::Decoded(descriptor) => MultimodalData::Decoded(descriptor),
+                    MediaDataDescriptor::Preprocessed(descriptor) => {
+                        MultimodalData::Preprocessed(descriptor)
+                    }
+                };
                 Self::replace_reserved_media_slot(
                     &mut media_map,
                     task.modality,
                     task.slot_idx,
-                    MultimodalData::Decoded(rdma_descriptor),
+                    media,
                 )?;
             }
         }
@@ -11975,7 +11995,7 @@ mod tests {
             ..Default::default()
         };
         preprocessor.media_loader = Some(
-            MediaLoader::new(media_decoder, Some(media_fetcher))
+            MediaLoader::new(media_decoder, None, Some(media_fetcher))
                 .expect("test media loader must initialize"),
         );
         preprocessor.video_routing_processor = Some(mm_routing::VideoRoutingProcessor::test_stub());

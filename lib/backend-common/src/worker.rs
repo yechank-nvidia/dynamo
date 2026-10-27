@@ -20,7 +20,7 @@ use dynamo_llm::local_model::runtime_config::{
 };
 use dynamo_llm::local_model::{LocalModel, LocalModelBuilder, update_model_taints};
 use dynamo_llm::model_type::{ModelInput, ModelType};
-use dynamo_llm::preprocessor::media::{MediaDecoder, MediaFetcher};
+use dynamo_llm::preprocessor::media::{MediaDecoder, MediaFetcher, MediaPreprocessor};
 use dynamo_llm::worker_type::WorkerType;
 use dynamo_runtime::config::HealthStatus;
 use dynamo_runtime::engine_routes::EngineRouteCallback;
@@ -226,6 +226,9 @@ pub struct WorkerConfig {
     /// Optional frontend media decoding and fetch policy advertised on the
     /// model deployment card.
     pub media_decoder: Option<MediaDecoder>,
+    /// Optional frontend media preprocessing policy advertised separately
+    /// from decoding.
+    pub media_preprocessor: Option<MediaPreprocessor>,
     pub media_fetcher: Option<MediaFetcher>,
     /// Deployment-level default thinking mode written to runtime metadata.
     pub default_thinking_mode: Option<String>,
@@ -266,6 +269,7 @@ impl Default for WorkerConfig {
             enable_rl: false,
             rl_metadata: None,
             media_decoder: None,
+            media_preprocessor: None,
             media_fetcher: None,
             default_thinking_mode: None,
         }
@@ -2240,6 +2244,7 @@ async fn build_local_model(
         .kv_cache_block_size(llm.kv_cache_block_size)
         .custom_template_path(config.custom_jinja_template.clone())
         .media_decoder(config.media_decoder.clone())
+        .media_preprocessor(config.media_preprocessor.clone())
         .media_fetcher(config.media_fetcher.clone())
         .runtime_config(rt_cfg);
 
@@ -2649,6 +2654,7 @@ mod tests {
     async fn build_local_model_carries_media_configuration() {
         let config = WorkerConfig {
             media_decoder: Some(MediaDecoder::default()),
+            media_preprocessor: Some(MediaPreprocessor::default()),
             media_fetcher: Some(MediaFetcher::default()),
             ..WorkerConfig::default()
         };
@@ -2663,6 +2669,7 @@ mod tests {
             .expect("name-only model with media config must build");
 
         assert!(local_model.card().media_decoder.is_some());
+        assert!(local_model.card().media_preprocessor.is_some());
         assert!(local_model.card().media_fetcher.is_some());
         assert_eq!(local_model.card().aliases, ["media-alias"]);
     }

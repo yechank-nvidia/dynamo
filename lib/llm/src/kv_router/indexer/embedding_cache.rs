@@ -45,6 +45,7 @@ pub fn preprocessed_multimodal_cache_keys(request: &PreprocessedRequest) -> Vec<
                     keys.push(key.to_string());
                 }
             }
+            MultimodalData::Preprocessed(media) => keys.extend(media.content_hashes.clone()),
             MultimodalData::UuidOnly(_) => {}
         }
     }

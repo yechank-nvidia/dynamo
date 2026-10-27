@@ -22,7 +22,7 @@ use super::extensions::{AgentContext, RouterParams};
 use super::llm_backend::DecoderCheckpoint;
 use super::timing::{RequestPhase, RequestTracker};
 use super::{OutputOptions, SamplingOptions, StopConditions};
-use crate::preprocessor::media::RdmaMediaDataDescriptor;
+use crate::preprocessor::media::{ProcessedMediaDataDescriptor, RdmaMediaDataDescriptor};
 use crate::protocols::TokenIdType;
 
 /// Routing hints for directing requests to specific workers.
@@ -286,6 +286,7 @@ pub enum MultimodalData {
     Decoded(RdmaMediaDataDescriptor),
     /// Payload-free media slot resolved by a backend processor cache.
     UuidOnly(String),
+    Preprocessed(ProcessedMediaDataDescriptor),
 }
 
 impl<'de> Deserialize<'de> for MultimodalData {
@@ -300,6 +301,7 @@ impl<'de> Deserialize<'de> for MultimodalData {
             RawUrl(String),
             Decoded(RdmaMediaDataDescriptor),
             UuidOnly(String),
+            Preprocessed(ProcessedMediaDataDescriptor),
         }
 
         match WireData::deserialize(deserializer)? {
@@ -312,6 +314,7 @@ impl<'de> Deserialize<'de> for MultimodalData {
             WireData::RawUrl(value) => Ok(Self::RawUrl(value)),
             WireData::Decoded(value) => Ok(Self::Decoded(value)),
             WireData::UuidOnly(value) => Ok(Self::UuidOnly(value)),
+            WireData::Preprocessed(value) => Ok(Self::Preprocessed(value)),
         }
     }
 }
@@ -884,6 +887,9 @@ mod tests {
                 MultimodalData::RawUrl(value) => OldData::RawUrl(value),
                 MultimodalData::Decoded(value) => OldData::Decoded(value),
                 MultimodalData::UuidOnly(value) => OldData::UuidOnly(value),
+                MultimodalData::Preprocessed(_) => {
+                    panic!("URL fixtures cannot contain processed media")
+                }
             };
             assert_eq!(
                 serde_json::to_value(legacy).unwrap(),

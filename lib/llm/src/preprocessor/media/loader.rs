@@ -16,8 +16,11 @@ use dynamo_protocols::types::ChatCompletionRequestUserMessageContentPart;
 use dynamo_runtime::error::{DynamoError, ErrorType};
 
 use super::common::EncodedMediaData;
-use super::decoders::{Decoder, MediaDecoder};
-use super::rdma::{DataType, RdmaMediaDataDescriptor, drain_nixl_notifications, get_nixl_agent};
+use super::decoders::{Decoder, MediaDecoder, MediaPreprocessor};
+use super::rdma::{
+    DataType, ProcessedMediaDataDescriptor, RdmaMediaDataDescriptor, drain_nixl_notifications,
+    get_nixl_agent,
+};
 use super::require_image_url;
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -65,6 +68,12 @@ pub fn max_data_url_bytes() -> usize {
             default
         }
     }
+}
+
+#[derive(Debug)]
+pub enum MediaDataDescriptor {
+    Decoded(RdmaMediaDataDescriptor),
+    Preprocessed(ProcessedMediaDataDescriptor),
 }
 
 // IP ranges that must never be reachable from a user-controlled URL.
@@ -476,6 +485,8 @@ impl LoaderCache {
 fn descriptor_bytes(d: &RdmaMediaDataDescriptor) -> u64 {
     let elem = match d.tensor_info.dtype {
         DataType::UINT8 => 1u64,
+        DataType::FLOAT32 => 4u64,
+        DataType::INT64 | DataType::FLOAT64 => 8u64,
     };
     d.tensor_info
         .shape
@@ -488,6 +499,8 @@ fn descriptor_bytes(d: &RdmaMediaDataDescriptor) -> u64 {
 pub struct MediaLoader {
     #[allow(dead_code)]
     media_decoder: MediaDecoder,
+    #[cfg(feature = "media-ffmpeg")]
+    video_processor: Option<Arc<dyn dynamo_multimodal::registry::VideoProcessor>>,
     #[allow(dead_code)]
     http_client: reqwest::Client,
     #[allow(dead_code)]
@@ -525,7 +538,11 @@ impl MediaLoader {
         h.finish()
     }
 
-    pub fn new(media_decoder: MediaDecoder, media_fetcher: Option<MediaFetcher>) -> Result<Self> {
+    pub fn new(
+        media_decoder: MediaDecoder,
+        media_preprocessor: Option<MediaPreprocessor>,
+        media_fetcher: Option<MediaFetcher>,
+    ) -> Result<Self> {
         media_decoder.warn_if_unavailable_backends();
 
         // Fall back to env-aware defaults so `DYN_MM_ALLOW_INTERNAL=1` is
@@ -534,6 +551,15 @@ impl MediaLoader {
         let http_client = media_fetcher.build_http_client()?;
 
         let nixl_agent = get_nixl_agent()?;
+
+        #[cfg(feature = "media-ffmpeg")]
+        let video_processor = media_preprocessor
+            .and_then(|preprocessor| preprocessor.video)
+            .map(dynamo_multimodal::registry::VideoProcessorRegistry::build)
+            .transpose()?;
+
+        #[cfg(not(feature = "media-ffmpeg"))]
+        let _ = media_preprocessor;
 
         let cache = match Self::cache_budget_bytes_from_env() {
             0 => {
@@ -553,6 +579,8 @@ impl MediaLoader {
 
         Ok(Self {
             media_decoder,
+            #[cfg(feature = "media-ffmpeg")]
+            video_processor,
             http_client,
             media_fetcher,
             nixl_agent,
@@ -569,7 +597,7 @@ impl MediaLoader {
         media_fetcher: Option<MediaFetcher>,
         budget_bytes: u64,
     ) -> Result<Self> {
-        let mut loader = Self::new(media_decoder, media_fetcher)?;
+        let mut loader = Self::new(media_decoder, None, media_fetcher)?;
         loader.cache = if budget_bytes == 0 {
             None
         } else {
@@ -587,7 +615,7 @@ impl MediaLoader {
         &self,
         oai_content_part: &ChatCompletionRequestUserMessageContentPart,
         media_io_kwargs: Option<&MediaDecoder>,
-    ) -> Result<RdmaMediaDataDescriptor> {
+    ) -> Result<MediaDataDescriptor> {
         self.fetch_and_decode_media_part_with_video_hash(oai_content_part, media_io_kwargs, false)
             .await
     }
@@ -597,7 +625,7 @@ impl MediaLoader {
         oai_content_part: &ChatCompletionRequestUserMessageContentPart,
         media_io_kwargs: Option<&MediaDecoder>,
         _hash_video: bool,
-    ) -> Result<RdmaMediaDataDescriptor> {
+    ) -> Result<MediaDataDescriptor> {
         // Drain before the cache lookup: the worker also reads cached buffers, so cache
         // hits add notifications too.
         drain_nixl_notifications(&self.nixl_agent);
@@ -620,7 +648,7 @@ impl MediaLoader {
                 let key = Self::cache_key(url.as_str());
                 if let Some(hit) = cache.lock().get(&key) {
                     tracing::debug!(url_hash = key, "[mm-cache] hit");
-                    return Ok(hit);
+                    return Ok(MediaDataDescriptor::Decoded(hit));
                 }
             }
         }
@@ -695,8 +723,34 @@ impl MediaLoader {
             _ => anyhow::bail!("Unsupported media type"),
         };
 
-        // A NIXL registration failure is a server fault and stays a 500.
-        let rdma_descriptor = decoded.into_rdma_descriptor(&self.nixl_agent)?;
+        // NIXL registration failures stay server errors.
+        let is_video = matches!(
+            oai_content_part,
+            ChatCompletionRequestUserMessageContentPart::VideoUrl(_)
+        );
+        let descriptor = if is_video {
+            #[cfg(feature = "media-ffmpeg")]
+            {
+                if let Some(processor) = self.video_processor.as_ref().map(Arc::clone) {
+                    // Resize and patchification are CPU-heavy. Keep them off
+                    // the async runtime just as the decode step above does.
+                    let output =
+                        tokio_rayon::spawn(move || decoded.preprocess_video(processor.as_ref()))
+                            .await?;
+                    let descriptor =
+                        ProcessedMediaDataDescriptor::from_processed(output, &self.nixl_agent)?;
+                    MediaDataDescriptor::Preprocessed(descriptor)
+                } else {
+                    MediaDataDescriptor::Decoded(decoded.into_rdma_descriptor(&self.nixl_agent)?)
+                }
+            }
+            #[cfg(not(feature = "media-ffmpeg"))]
+            {
+                MediaDataDescriptor::Decoded(decoded.into_rdma_descriptor(&self.nixl_agent)?)
+            }
+        } else {
+            MediaDataDescriptor::Decoded(decoded.into_rdma_descriptor(&self.nixl_agent)?)
+        };
 
         // Insert into the cache on the way out. We only cache image inputs
         // (matched in the lookup above) and only when no per-request decoder
@@ -710,12 +764,14 @@ impl MediaLoader {
             && let Some(url) = image_part.image_url.as_ref().map(|media| &media.url)
         {
             let key = Self::cache_key(url.as_str());
-            let bytes = descriptor_bytes(&rdma_descriptor);
-            cache.lock().put(key, rdma_descriptor.clone());
-            tracing::debug!(url_hash = key, bytes, "[mm-cache] insert");
+            if let MediaDataDescriptor::Decoded(rdma_descriptor) = &descriptor {
+                let bytes = descriptor_bytes(rdma_descriptor);
+                cache.lock().put(key, rdma_descriptor.clone());
+                tracing::debug!(url_hash = key, bytes, "[mm-cache] insert");
+            }
         }
 
-        Ok(rdma_descriptor)
+        Ok(descriptor)
     }
 }
 
@@ -753,7 +809,7 @@ mod tests {
             ..Default::default()
         };
 
-        let loader: MediaLoader = match MediaLoader::new(media_decoder, Some(fetcher)) {
+        let loader: MediaLoader = match MediaLoader::new(media_decoder, None, Some(fetcher)) {
             Ok(l) => l,
             Err(e) => {
                 println!(
@@ -783,6 +839,9 @@ mod tests {
                 return;
             }
             Err(e) => panic!("Failed to fetch and decode image: {}", e),
+        };
+        let MediaDataDescriptor::Decoded(descriptor) = descriptor else {
+            panic!("image decoding must return decoded media");
         };
         mock.assert_async().await;
         assert_eq!(descriptor.tensor_info.dtype, DataType::UINT8);
@@ -871,7 +930,7 @@ mod tests {
             allow_private_ips: true,
             ..Default::default()
         };
-        let loader = match MediaLoader::new(media_decoder, Some(fetcher)) {
+        let loader = match MediaLoader::new(media_decoder, None, Some(fetcher)) {
             Ok(l) => l,
             Err(e) => {
                 println!(
@@ -991,6 +1050,11 @@ mod tests {
 
         // Both descriptors should reference the same NIXL-registered storage
         // (cloned `Arc` under the hood — same pointer).
+        let (MediaDataDescriptor::Decoded(first), MediaDataDescriptor::Decoded(second)) =
+            (first, second)
+        else {
+            panic!("image cache must return decoded media");
+        };
         match (&first.source_storage, &second.source_storage) {
             (Some(a), Some(b)) => assert!(
                 Arc::ptr_eq(a, b),

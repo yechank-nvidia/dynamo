@@ -43,7 +43,7 @@ use crate::ModelInput;
 use crate::context::Context as PyContext;
 use crate::errors::{http_like_error_to_dynamo, py_exception_to_backend_error};
 use crate::llm::kv::KvEventPublisher as PyKvEventPublisher;
-use crate::llm::preprocessor::{MediaDecoder, MediaFetcher};
+use crate::llm::preprocessor::{MediaDecoder, MediaFetcher, MediaPreprocessor};
 use crate::to_pyerr;
 
 fn sidecar_startup_to_pyerr(error: SidecarStartupError) -> PyErr {
@@ -440,6 +440,7 @@ impl WorkerConfig {
         media_fetcher = None,
         kv_state_endpoint = None,
         default_thinking_mode = None,
+        media_preprocessor = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -467,6 +468,7 @@ impl WorkerConfig {
         media_fetcher: Option<MediaFetcher>,
         kv_state_endpoint: Option<String>,
         default_thinking_mode: Option<String>,
+        media_preprocessor: Option<MediaPreprocessor>,
     ) -> PyResult<Self> {
         // Delegating to the same conversion used by `register_model`.
         let model_input_rs = match model_input {
@@ -535,6 +537,7 @@ impl WorkerConfig {
                 enable_rl: false,
                 rl_metadata: None,
                 media_decoder: media_decoder.map(|decoder| decoder.inner),
+                media_preprocessor: media_preprocessor.map(|preprocessor| preprocessor.inner),
                 media_fetcher: media_fetcher.map(|fetcher| fetcher.inner),
             },
         })
