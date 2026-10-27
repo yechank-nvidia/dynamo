@@ -189,6 +189,64 @@ def test_nvdec_video_data_builds_pt_videodata(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("use_nvdec", [False, True])
+async def test_mixed_media_uses_model_preferred_raw_video(monkeypatch, use_nvdec) -> None:
+    import numpy as np
+    from PIL import Image
+    from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase
+    from dynamo.common.multimodal import nvdec_decoder
+
+    preferred = SimpleNamespace(
+        get_preferred_media_io_kwargs=lambda: {"video": {"format": "np"}}
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm.inputs.create_input_processor", lambda *args: preferred
+    )
+    processor = MultimodalRequestProcessor("multimodal", "unused", 10, MagicMock())
+    image = Image.new("RGB", (4, 4))
+    frames = np.arange(96, dtype=np.uint8).reshape(2, 4, 4, 3)
+    metadata = {"total_num_frames": 2, "fps": 2.0, "frames_indices": [0, 1]}
+    processor.image_loader.load_image_batch = AsyncMock(return_value=[image])
+    monkeypatch.setattr(processor, "_expanded_prompt_len", lambda *args: None)
+    monkeypatch.setattr(mmp, "probe_video_codec", lambda content: "h264")
+    monkeypatch.setattr(mmp, "should_use_nvdec", lambda codec: use_nvdec)
+    monkeypatch.setattr(
+        nvdec_decoder, "decode_video_nvdec", lambda *args: (frames, metadata)
+    )
+
+    async def decode_video(*args, format="pt", **kwargs):
+        decoded = frames if format == "np" else [torch.zeros(3, 4, 4)] * 2
+        return mmp.VideoData(frames=decoded, metadata=metadata)
+
+    monkeypatch.setattr(mmp, "async_load_video", decode_video)
+    result = await processor.process_openai_request(
+        {
+            "multi_modal_data": {
+                "image_url": [{"Url": "https://example.com/image.png"}],
+                "video_url": [{"Url": "data:video/mp4;base64,dmlkZW8="}],
+            },
+            "token_ids": [1],
+        },
+        embeddings=None,
+        ep_disaggregated_params=None,
+    )
+    mm_data = result["multi_modal_data"]
+    assert mm_data["image"][0] is image
+    assert mm_data["video"][0].frames is frames
+    hf_processor = MagicMock(return_value={})
+    Qwen3VLInputProcessorBase._preprocess(
+        SimpleNamespace(processor=hf_processor),
+        "describe",
+        mm_data,
+        {},
+        defer_pixel_normalization=True,
+    )
+    assert hf_processor.call_args.kwargs["videos"][0] is frames
+    assert hf_processor.call_args.kwargs["do_rescale"] is False
+    assert hf_processor.call_args.kwargs["do_normalize"] is False
+
+
+@pytest.mark.asyncio
 async def test_h264_video_routes_through_nvdec(monkeypatch) -> None:
     """H.264 video input is hardware-decoded via NVDEC; the vendor
     async_load_video is bypassed. Other codecs fall back to it (covered by

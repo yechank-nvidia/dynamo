@@ -58,19 +58,20 @@ _EMBEDDING_FETCH_MIN_RATE = 64 * 1024
 _EMBEDDING_FETCH_READ_TIMEOUT_S = 300.0
 
 
-def _nvdec_video_data(content: bytes, num_frames: int) -> VideoData:
-    """Decode H.264/H.265 via NVDEC into TRT-LLM's ``VideoData`` (format="pt").
+def _nvdec_video_data(content: bytes, num_frames: int, format: str = "pt") -> VideoData:
+    """Decode H.264/H.265 into the model's preferred TRT-LLM video format.
 
-    Mirrors ``tensorrt_llm.inputs.media_io._load_video_by_cv2``'s "pt" output for
-    the pinned v1.3.0rc21: RGB, a list of ``(C, H, W)`` float32 [0,1] tensors,
-    with the same metadata keys. Synchronous -- call via ``asyncio.to_thread``.
+    ``np`` keeps uint8 THWC RGB; the default ``pt`` returns float32 CHW frame
+    tensors in [0,1], matching TRT-LLM's video loader. Call via ``asyncio.to_thread``.
     """
     from dynamo.common.multimodal.nvdec_decoder import decode_video_nvdec
 
     frames_np, meta = decode_video_nvdec(content, num_frames)  # (N,H,W,3) uint8 RGB
-    stacked = frames_np.astype("float32") * (1.0 / 255.0)
-    nchw = torch.from_numpy(stacked).permute(0, 3, 1, 2).contiguous()
-    frames_pt = list(torch.unbind(nchw, dim=0))
+    frames = frames_np
+    if format == "pt":
+        stacked = frames_np.astype("float32") * (1.0 / 255.0)
+        nchw = torch.from_numpy(stacked).permute(0, 3, 1, 2).contiguous()
+        frames = list(torch.unbind(nchw, dim=0))
     fps = float(meta.get("fps") or 0.0)
     total = int(meta["total_num_frames"])
     metadata = {
@@ -79,7 +80,7 @@ def _nvdec_video_data(content: bytes, num_frames: int) -> VideoData:
         "duration": (total / fps) if fps > 0 else 0.0,
         "frames_indices": meta["frames_indices"],
     }
-    return VideoData(frames=frames_pt, metadata=metadata, audio=None)
+    return VideoData(frames=frames, metadata=metadata, audio=None)
 
 
 class TokenizerProtocol(Protocol):
@@ -192,6 +193,10 @@ class MultimodalRequestProcessor:
             self.input_processor = create_input_processor(model_dir, self.tokenizer)
         except Exception as e:
             logging.warning("Input processor unavailable for max_tokens sizing: %s", e)
+        preferred_media_io = getattr(
+            self.input_processor, "get_preferred_media_io_kwargs", lambda: {}
+        )()
+        self.video_format = preferred_media_io.get("video", {}).get("format", "pt")
 
     def _expanded_prompt_len(
         self, token_ids: List[int], images: Optional[List[Any]]
@@ -602,10 +607,13 @@ class MultimodalRequestProcessor:
                         # codecs via the vendor cv2 loader. NVDEC failure falls back.
                         nvdec_video = None
                         codec = probe_video_codec(content)
-                        if should_use_nvdec(codec):
+                        if should_use_nvdec(codec) and self.video_format in ("pt", "np"):
                             try:
                                 nvdec_video = await asyncio.to_thread(
-                                    _nvdec_video_data, content, self.num_video_frames
+                                    _nvdec_video_data,
+                                    content,
+                                    self.num_video_frames,
+                                    self.video_format,
                                 )
                             except Exception as exc:  # noqa: BLE001 - fall back
                                 logging.warning(
@@ -624,7 +632,9 @@ class MultimodalRequestProcessor:
                                 try:
                                     videos.append(
                                         await async_load_video(
-                                            video_file.name, self.num_video_frames
+                                            video_file.name,
+                                            self.num_video_frames,
+                                            format=self.video_format,
                                         )
                                     )
                                 except ImportError as exc:
@@ -644,7 +654,9 @@ class MultimodalRequestProcessor:
                         try:
                             videos.append(
                                 await async_load_video(
-                                    normalized_url, self.num_video_frames
+                                    normalized_url,
+                                    self.num_video_frames,
+                                    format=self.video_format,
                                 )
                             )
                         except ImportError as exc:
