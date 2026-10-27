@@ -24,15 +24,18 @@ import signal
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from dynamo._core import backend as _backend
 from dynamo.common.constants import DisaggregationMode
-from dynamo.llm import MediaDecoder, MediaFetcher, MediaPreprocessor, ModelInput
+from dynamo.llm import MediaDecoder, MediaFetcher, ModelInput
 from dynamo.runtime.logging import configure_dynamo_logging
 
 from .engine import BaseEngine, RawEngine
 from .health_check import parse_health_check_payload_cli
+
+if TYPE_CHECKING:
+    from dynamo.llm import MediaPreprocessor
 
 logger = logging.getLogger(__name__)
 
