@@ -16,22 +16,20 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
+from tensorrt_llm.llmapi import DisaggregatedParams
+from tensorrt_llm.llmapi.llm import SamplingParams
 from tensorrt_llm.llmapi.llm_args import (
     TorchLlmArgs,
     update_llm_args_with_extra_options,
 )
 
-from dynamo.llm.exceptions import InvalidArgument
-
-from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
-from tensorrt_llm.llmapi import DisaggregatedParams
-from tensorrt_llm.llmapi.llm import SamplingParams
-
 from dynamo.common.backend.logprobs import extract_from_completion_output
-from dynamo.llm.exceptions import EngineShutdown
+from dynamo.llm.exceptions import EngineShutdown, InvalidArgument
 from dynamo.trtllm.constants import DisaggregationMode
 from dynamo.trtllm.health_check import HEALTH_CHECK_CACHE_SALT, TrtllmHealthCheckPayload
 from dynamo.trtllm.multimodal_processor import MultimodalRequestProcessor
+from dynamo.trtllm.publisher import KvEventPublicationMode
 from dynamo.trtllm.request_handlers.handler_base import (
     BYPASS_REMOTE_PREFILL_ANNOTATION,
     HandlerBase,
@@ -1530,6 +1528,66 @@ class TestGenerateLocally:
 
         _, kwargs = handler.engine.llm.generate_async.call_args
         assert "expanded_prompt_len" not in kwargs["inputs"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("mode", "v2", "register"),
+        [
+            (KvEventPublicationMode.POLLING, True, True),
+            (KvEventPublicationMode.POLLING, False, False),
+            (KvEventPublicationMode.DISABLED, True, False),
+            (KvEventPublicationMode.STREAMING, True, False),
+        ],
+    )
+    async def test_v2_routing_digest_registered_before_submission(
+        self, mode, v2, register
+    ):
+        handler = self._make_handler()
+        handler.publisher = MagicMock()
+        handler.publisher.check_error_queue.return_value = None
+        handler.publisher.kv_event_publication_mode = mode
+        handler.multimodal_processor = MagicMock()
+        handler.multimodal_processor.input_processor.get_vocab_size.return_value = (
+            151936
+        )
+        handler.engine.llm.args.kv_cache_config.use_kv_cache_manager_v2 = v2
+        media = {"image": [mock.sentinel.image]}
+        uuids = {"image": ["348c9b76cc5d7e1d"]}
+        handler._prepare_input_for_generation = mock.AsyncMock(
+            return_value={
+                "prompt_token_ids": [1, 2, 3],
+                "multi_modal_data": media,
+                "multi_modal_uuids": uuids,
+            }
+        )
+
+        def submit(**kwargs):
+            assert handler.publisher.register_mm_hashes.called is register
+            return self._make_mock_generation_result()
+
+        handler.engine.llm.generate_async = MagicMock(side_effect=submit)
+        request = {
+            "token_ids": [1, 2, 3],
+            "stop_conditions": {"max_tokens": 10},
+            "sampling_options": {},
+            "extra_args": {"mm_hashes": uuids["image"]},
+        }
+        with mock.patch(
+            "dynamo.trtllm.request_handlers.handler_base.apply_mm_hashes",
+            return_value=({"image": ["a" * 64]}, uuids),
+        ) as native_hash:
+            chunks = [
+                c async for c in handler.generate_locally(request, self._make_context())
+            ]
+        assert chunks
+        if register:
+            native_hash.assert_called_once_with(media, uuids)
+            handler.publisher.register_mm_hashes.assert_called_once_with(
+                ["a" * 64], uuids["image"], 151936
+            )
+        else:
+            native_hash.assert_not_called()
+            handler.publisher.register_mm_hashes.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_routing_cache_salt_forwarded_to_generate_async(self):

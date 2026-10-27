@@ -34,6 +34,7 @@ from pydantic import TypeAdapter
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.executor.utils import RequestError
+from tensorrt_llm.inputs.multimodal import apply_mm_hashes
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi.llm import SamplingParams
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -71,7 +72,7 @@ from dynamo.trtllm.health_check import HEALTH_CHECK_CACHE_SALT
 from dynamo.trtllm.logits_processing.adapter import create_trtllm_adapters
 from dynamo.trtllm.metrics import AdditionalMetricsCollector
 from dynamo.trtllm.multimodal_processor import MultimodalRequestProcessor
-from dynamo.trtllm.publisher import Publisher
+from dynamo.trtllm.publisher import KvEventPublicationMode, Publisher
 from dynamo.trtllm.request_handlers.base_generative_handler import BaseGenerativeHandler
 from dynamo.trtllm.utils.disagg_utils import (
     DisaggregatedParams,
@@ -1187,6 +1188,29 @@ class HandlerBase(BaseGenerativeHandler):
         processed_input = await self._prepare_input_for_generation(
             request, embeddings, ep_disaggregated_params, epd_metadata
         )
+
+        if (
+            self.publisher
+            and isinstance(processed_input, dict)
+            and (processed_input.get("multi_modal_uuids") or {}).get("image")
+            and (request.get("extra_args") or {}).get("mm_hashes")
+            and self.multimodal_processor
+            and self.multimodal_processor.input_processor
+            and self.publisher.kv_event_publication_mode
+            == KvEventPublicationMode.POLLING
+            and self.engine.llm.args.kv_cache_config.use_kv_cache_manager_v2
+        ):
+            # V2 does not echo the routing UUID. Reuse the engine's exact
+            # UUID+content hash before submission, while the media is available.
+            native_hashes, _ = apply_mm_hashes(
+                processed_input["multi_modal_data"],
+                processed_input["multi_modal_uuids"],
+            )
+            self.publisher.register_mm_hashes(
+                native_hashes["image"],
+                request["extra_args"]["mm_hashes"],
+                self.multimodal_processor.input_processor.get_vocab_size(),
+            )
 
         # Check if there is an error in the publisher error queue
         publishers_error = (

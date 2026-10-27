@@ -33,6 +33,7 @@ import asyncio
 import logging
 import queue
 import threading
+from collections import OrderedDict
 from unittest.mock import MagicMock
 
 import pytest
@@ -513,6 +514,8 @@ def _publisher_for_kv_event_test():
     pub.partial_block_hashes = set()
     pub.kv_block_size = 4
     pub.max_window_size = None
+    pub._mm_routing_hashes = OrderedDict()
+    pub._mm_routing_hashes_lock = threading.Lock()
     return pub
 
 
@@ -537,6 +540,159 @@ def _stored_kv_event(cache_salt="tenant-a"):
             ],
         },
     }
+
+
+# Digest captured from a native V2 publisher failure. It is BLAKE3(UUID+media),
+# not the frontend's 348c9b76cc5d7e1d routing hash.
+_V2_DIGEST = "27a7168e7b9241f77133d27148662791f6cecb9386dab5e0a45dd522104af594"
+_PAIR_V2_DIGEST = "2659bb4c0b83dbcbff2336731a228f2d887d3c5b55ed5a1305559ab707f79224"
+
+
+@pytest.mark.parametrize("continuation", [False, True])
+def test_v2_digest_and_continuation_match_request_pads(continuation):
+    pub = _publisher_for_kv_event_test()
+    pub.register_mm_hashes([_V2_DIGEST], ["348c9b76cc5d7e1d"], 151936)
+    event = _stored_kv_event()
+    event["hash_algo"] = "v1_block_key"
+    block = event["data"]["blocks"][0]
+    block["mm_keys"] = [
+        {
+            "type": "mm_key",
+            "hash": _V2_DIGEST,
+            "start_offset": 28 if continuation else 0,
+        }
+    ]
+    tokens = (
+        [151964, 151965, 151966, 151653]
+        if continuation
+        else [151652, _V2_DIGEST, 151937, 151938]
+    )
+    block["tokens"] = [{"token_id": t} for t in tokens]
+
+    _, normalized = pub._normalize_kv_event(event)
+
+    assert normalized["token_ids"] == (
+        [208453725, 208453725, 208453725, 151653]
+        if continuation
+        else [151652, 208453725, 208453725, 208453725]
+    )
+    assert normalized["block_mm_infos"] == [None]
+    assert normalized["block_hashes"] == [123]
+    assert block["tokens"] == [{"token_id": t} for t in tokens]
+
+
+@pytest.mark.parametrize("bad_offset", [0, 2])
+def test_v2_bad_offsets_drop_only_the_bad_event(bad_offset, caplog):
+    pub = _publisher_for_kv_event_test()
+    pub.register_mm_hashes([_V2_DIGEST], ["348c9b76cc5d7e1d"], 151936)
+    pub.zmq_kv_event_publisher = None
+    publisher = MagicMock()
+    pub.kv_event_publishers = {0: publisher}
+    event = _stored_kv_event()
+    event["hash_algo"] = "v1_block_key"
+    block = event["data"]["blocks"][0]
+    block["mm_keys"] = [
+        {"type": "mm_key", "hash": _V2_DIGEST, "start_offset": bad_offset}
+    ]
+    block["tokens"] = [{"token_id": t} for t in [151937, 151938, 151939, 151940]]
+    valid = _stored_kv_event()
+    valid["event_id"] = 2
+
+    with caplog.at_level(logging.ERROR):
+        pub._handle_kv_event_batch([event, valid])
+
+    publisher.publish_batch.assert_called_once()
+    assert len(publisher.publish_batch.call_args.args[0]) == 1
+    assert "Dropping malformed TensorRT-LLM KV event" in caplog.text
+
+
+@pytest.mark.parametrize("mixed_image_video", [False, True])
+def test_unknown_video_digest_drops_whole_event_and_keeps_later_text(mixed_image_video):
+    pub = _publisher_for_kv_event_test()
+    pub.register_mm_hashes([_V2_DIGEST], ["348c9b76cc5d7e1d"], 151936)
+    pub.zmq_kv_event_publisher = None
+    publisher = MagicMock()
+    pub.kv_event_publishers = {0: publisher}
+    event = _stored_kv_event()
+    event["hash_algo"] = "v1_block_key"
+    # Video keys have no canonical entry in the image-only digest bridge.
+    unknown_digest = "f" * 64
+    video_block = event["data"]["blocks"][0]
+    video_block["block_hash"] = 789
+    video_block["mm_keys"] = [
+        {"type": "mm_key", "hash": unknown_digest, "start_offset": 0}
+    ]
+    video_block["tokens"] = [
+        {"token_id": token} for token in [unknown_digest, 151937, 151938, 151939]
+    ]
+    if mixed_image_video:
+        event["data"]["blocks"].insert(
+            0,
+            {
+                "block_hash": 456,
+                "cache_salt": "tenant-a",
+                "mm_keys": [{"type": "mm_key", "hash": _V2_DIGEST, "start_offset": 0}],
+                "tokens": [
+                    {"token_id": token}
+                    for token in [_V2_DIGEST, 151937, 151938, 151939]
+                ],
+            },
+        )
+    valid = _stored_kv_event()
+    valid["event_id"] = 2
+
+    pub._handle_kv_event_batch([event, valid])
+
+    publisher.publish_batch.assert_called_once()
+    published = publisher.publish_batch.call_args.args[0]
+    assert len(published) == 1
+    assert published[0]["block_hashes"] == [123]
+    assert published[0]["token_ids"] == [1, 2, 3, 4]
+
+
+def test_v2_digest_bridge_is_bounded_and_unknown_digest_is_dropped(monkeypatch):
+    pub = _publisher_for_kv_event_test()
+    monkeypatch.setattr(publisher_mod, "_MM_ROUTING_HASH_CAPACITY", 1)
+    pub.register_mm_hashes([_V2_DIGEST], ["348c9b76cc5d7e1d"], 151936)
+    pub.register_mm_hashes(["a" * 64], ["b2431614098884ea"], 151936)
+    assert len(pub._mm_routing_hashes) == 1
+    event = _stored_kv_event()
+    event["hash_algo"] = "v1_block_key"
+    block = event["data"]["blocks"][0]
+    block["mm_keys"] = [{"type": "mm_key", "hash": _V2_DIGEST, "start_offset": 0}]
+    block["tokens"][0]["token_id"] = _V2_DIGEST
+
+    assert pub._normalize_kv_event(event) is None
+
+
+@pytest.mark.parametrize("digest", [_V2_DIGEST, _PAIR_V2_DIGEST])
+def test_publisher_thread_survives_unmapped_real_v2_digest(digest):
+    pub = _publisher_for_kv_event_test()
+    pub.zmq_kv_event_publisher = None
+    publisher = MagicMock()
+    pub.kv_event_publishers = {0: publisher}
+    bad = _stored_kv_event()
+    bad["hash_algo"] = "v1_block_key"
+    block = bad["data"]["blocks"][0]
+    block["mm_keys"] = [{"type": "mm_key", "hash": digest, "start_offset": 0}]
+    block["tokens"][0]["token_id"] = digest
+    valid = _stored_kv_event()
+    valid["event_id"] = 2
+    errors = queue.Queue()
+
+    async def publish_once():
+        pub._handle_kv_event_batch([bad, valid])
+        thread._stop_event.set()
+        return True
+
+    thread = publisher_mod.ManagedThread(publish_once, error_queue=errors)
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert errors.empty()
+    publisher.publish_batch.assert_called_once()
+    assert len(publisher.publish_batch.call_args.args[0]) == 1
 
 
 def test_handle_kv_event_forwards_cache_salt_to_direct_publisher():
@@ -580,7 +736,7 @@ def test_handle_zmq_kv_event_batch_preserves_singleton_publication():
     pub.zmq_kv_event_publisher.publish_removed.assert_called_once_with([123], 0)
 
 
-def test_handle_zmq_kv_event_batch_stops_on_malformed_event():
+def test_handle_zmq_kv_event_batch_continues_after_malformed_event(caplog):
     pub = _publisher_for_kv_event_test()
     pub.zmq_kv_event_publisher = MagicMock()
     pub.kv_event_publishers = None
@@ -590,11 +746,12 @@ def test_handle_zmq_kv_event_batch_stops_on_malformed_event():
         "data": {"type": "removed", "block_hashes": [123]},
     }
 
-    with pytest.raises(KeyError, match="event_id"):
+    with caplog.at_level(logging.ERROR):
         pub._handle_zmq_kv_event_batch([_stored_kv_event(), {}, removed])
 
     pub.zmq_kv_event_publisher.publish_stored.assert_called_once()
-    pub.zmq_kv_event_publisher.publish_removed.assert_not_called()
+    pub.zmq_kv_event_publisher.publish_removed.assert_called_once_with([123], 0)
+    assert "Dropping malformed TensorRT-LLM KV event" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -947,16 +1104,18 @@ def test_handle_kv_event_batch_preserves_unknown_rank_warning(caplog):
     assert "No publisher for attention_dp_rank=1, available ranks: [0]" in caplog.text
 
 
-def test_handle_kv_event_batch_propagates_malformed_event():
+def test_handle_kv_event_batch_continues_after_malformed_event(caplog):
     pub = _publisher_for_kv_event_test()
     publisher = MagicMock()
     pub.zmq_kv_event_publisher = None
     pub.kv_event_publishers = {0: publisher}
 
-    with pytest.raises(KeyError, match="event_id"):
-        pub._handle_kv_event_batch([{}])
+    with caplog.at_level(logging.ERROR):
+        pub._handle_kv_event_batch([{}, _stored_kv_event()])
 
-    publisher.publish_batch.assert_not_called()
+    publisher.publish_batch.assert_called_once()
+    assert len(publisher.publish_batch.call_args.args[0]) == 1
+    assert "Dropping malformed TensorRT-LLM KV event" in caplog.text
 
 
 def test_handle_kv_event_batch_propagates_publish_failure():

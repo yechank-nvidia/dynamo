@@ -28,6 +28,7 @@ import threading
 import time
 import traceback
 import weakref
+from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from enum import Enum
@@ -38,6 +39,7 @@ import msgspec
 import zmq
 from prometheus_client import CollectorRegistry
 
+from dynamo.common.multimodal.routing_utils import pad_value_for_mm_hash
 from dynamo.common.utils.prometheus import LLMBackendMetrics
 from dynamo.llm import FpmDirectPublisher, KvEventPublisher, WorkerMetricsPublisher
 from dynamo.trtllm.utils.request_utils import stored_event_cache_salt
@@ -64,6 +66,7 @@ _KV_EVENTS_MIN_SLEEP_SEC = 0.005
 _KV_EVENTS_MAX_SLEEP_SEC = 0.02
 _KV_EVENTS_BACKOFF_FACTOR = 1.5
 _STREAMING_KV_EVENT_HOSTS_ENV = "DYN_TRTLLM_KV_EVENT_HOSTS"
+_MM_ROUTING_HASH_CAPACITY = 65_536
 
 
 class KvEventPublicationMode(str, Enum):
@@ -546,6 +549,10 @@ class Publisher:
         self.metrics_collector = metrics_collector
         self.kv_state_endpoint = kv_state_endpoint
         self.image_token_id = image_token_id
+        # V2 emits native content digests rather than the UUID echoed by V1.
+        # Bound the bridge; eviction may lose a routing hint, never cache data.
+        self._mm_routing_hashes: OrderedDict[str, tuple[int, int]] = OrderedDict()
+        self._mm_routing_hashes_lock = threading.Lock()
         self.publish_metrics = publish_metrics
         self.publish_forward_pass_metrics = publish_forward_pass_metrics
         self.kv_event_publication_mode = kv_event_publication_mode
@@ -1020,7 +1027,72 @@ class Publisher:
         if self.additional_metrics is not None:
             self.additional_metrics.record_kv_event_drain_batch(batch_size)
 
+    def register_mm_hashes(
+        self, digests: list[str], routing_hashes: list[str], vocab_size: Optional[int]
+    ) -> None:
+        """Connect native V2 digests to the frontend's canonical image hashes."""
+        if not isinstance(vocab_size, int) or vocab_size <= 0:
+            raise ValueError("A positive vocabulary size is required for V2 MM events")
+        with self._mm_routing_hashes_lock:
+            for digest, routing_hash in zip(digests, routing_hashes, strict=True):
+                self._mm_routing_hashes[digest] = (
+                    int(routing_hash[:16], 16),
+                    vocab_size,
+                )
+                self._mm_routing_hashes.move_to_end(digest)
+            while len(self._mm_routing_hashes) > _MM_ROUTING_HASH_CAPACITY:
+                self._mm_routing_hashes.popitem(last=False)
+
+    def _normalize_v2_mm_tokens(self, block: dict) -> list[int]:
+        """Replace digest-first/indexed V2 image runs with request-side pads."""
+        keys = block["mm_keys"]
+        with self._mm_routing_hashes_lock:
+            identities = {
+                key["hash"]: self._mm_routing_hashes[key["hash"]] for key in keys
+            }
+        vocab_size = identities[keys[0]["hash"]][1]
+        mm_keys = iter(keys)
+        token_ids = []
+        pad = next_token = None
+        for token in block["tokens"]:
+            token_id = token["token_id"]
+            if isinstance(token_id, str) and len(token_id) == 64:
+                key = next(mm_keys)
+                if key["hash"] != token_id or key["start_offset"] != 0:
+                    raise ValueError("Inconsistent V2 multimodal digest metadata")
+                pad = pad_value_for_mm_hash(identities[key["hash"]][0])
+                next_token = vocab_size + 1
+                token_ids.append(pad)
+            elif int(token_id) >= vocab_size:
+                if pad is None:
+                    key = next(mm_keys)
+                    if key["start_offset"] <= 0:
+                        raise ValueError("Missing V2 multimodal continuation offset")
+                    pad = pad_value_for_mm_hash(identities[key["hash"]][0])
+                    next_token = vocab_size + key["start_offset"]
+                if int(token_id) != next_token:
+                    raise ValueError("Non-consecutive V2 multimodal token offsets")
+                token_ids.append(pad)
+                next_token += 1
+            else:
+                token_ids.append(int(token_id))
+                pad = next_token = None
+        if next(mm_keys, None) is not None:
+            raise ValueError("Unmapped V2 multimodal metadata")
+        return token_ids
+
     def _normalize_kv_event(self, event):
+        try:
+            if not isinstance(event, dict):
+                raise TypeError("KV event must be a dict")
+            return self._normalize_kv_event_impl(event)
+        except (KeyError, TypeError, ValueError, OverflowError, StopIteration):
+            # A malformed engine event must not stop the polling thread or
+            # turn the next inference request into a publisher error.
+            logger.exception("Dropping malformed TensorRT-LLM KV event")
+            return None
+
+    def _normalize_kv_event_impl(self, event):
         event_id = event["event_id"]
         attention_dp_rank = event.get("attention_dp_rank", 0)
 
@@ -1082,6 +1154,10 @@ class Publisher:
                     break
                 num_block_tokens.append(token_num_in_block)
                 block_hashes.append(block_hash)
+                if event.get("hash_algo") and block.get("mm_keys"):
+                    token_ids.extend(self._normalize_v2_mm_tokens(block))
+                    block_mm_infos.append(None)
+                    continue
                 token_ids.extend(int(t["token_id"]) for t in block_tokens)
 
                 mm_keys = block.get("mm_keys")
